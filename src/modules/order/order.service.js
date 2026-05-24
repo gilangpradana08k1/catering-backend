@@ -1,0 +1,929 @@
+import { validateStockOrderMenu } from "../stock/stock.service.js";
+import menuService from "../menu/menu.service.js";
+import prisma from "../../config/db/prisma.js";
+import {
+  formatDateWIB,
+  formatPhoneNumber,
+  setDateTime,
+  setDateTimeEnd,
+  generateOrderCode,
+  setDate,
+} from "../../utils/helpers.js";
+import { buildPagination } from "../../common/response.js";
+import moment from "moment";
+import exporter from "../../utils/exporter.js";
+import { CustomerType } from "@prisma/client";
+import { generateInvoicePDF } from "../../lib/invoice-pdf.js";
+import {
+  sendWhatsAppNotification,
+  buildOrderNotificationMessage,
+} from "../../lib/fonnte.js";
+
+export const calculateOrderItems = (items, shippingCost = 0, discount = 0) => {
+  const totalPerItem = items.map((item) => {
+    const subtotal = Number(item.quantity) * Number(item.price);
+    return {
+      menu_id: item.menu_id,
+      quantity: item.quantity,
+      subtotal,
+    };
+  });
+
+  const totalPrice =
+    totalPerItem.reduce((total, row) => total + row.subtotal, 0) -
+    discount +
+    shippingCost;
+
+  if (totalPrice < 0) {
+    throw {
+      statusCode: 400,
+      message:
+        "Total harga tidak boleh negatif, pastikan diskon tidak melebihi total harga sebelum diskon",
+    };
+  }
+
+  return {
+    totalPerItem,
+    totalPrice,
+    discount,
+  };
+};
+
+const validateOrderStock = async (items, orderDate, isUpdate = false) => {
+  const insufficientStockItems = [];
+
+  for (const item of items) {
+    const { menu_id: menuId, quantity } = item;
+    const menu = await menuService.getMenuById(menuId);
+
+    if (!menu) {
+      insufficientStockItems.push({
+        menu: { name: "Menu tidak ditemukan" },
+        reason: "Menu tidak ditemukan",
+      });
+      continue;
+    }
+
+    if (menu.min_order && quantity < menu.min_order) {
+      insufficientStockItems.push({
+        reason: `Minimum order untuk menu "${menu.name}" adalah ${menu.min_order} porsi, Anda memesan ${quantity} porsi.`,
+      });
+      continue;
+    }
+
+    if (!isUpdate) {
+      const { is_available, out_of_stock } =
+        await validateStockOrderMenu(orderDate);
+
+      if (!is_available) {
+        insufficientStockItems.push({
+          reason: `Mohon maaf, stock order untuk tanggal ${formatDateWIB(orderDate, false)} belum tersedia. Silakan pilih tanggal lain atau hubungi admin untuk informasi lebih lanjut.`,
+        });
+        continue;
+      }
+
+      if (out_of_stock) {
+        insufficientStockItems.push({
+          reason: `Mohon maaf, pesanan untuk tanggal ${formatDateWIB(orderDate, false)} telah melampaui batas maksimal. Silakan pilih tanggal lain.`,
+        });
+        continue;
+      }
+    }
+  }
+
+  if (insufficientStockItems.length > 0) {
+    const errorMessage = insufficientStockItems
+      .map((item) => `${item.reason}`)
+      .join("; ");
+    throw { statusCode: 400, message: errorMessage };
+  }
+};
+
+const checkDateOrderStock = async (orderDate) => {
+  const { is_available, out_of_stock } =
+    await validateStockOrderMenu(orderDate);
+
+  return {
+    is_available,
+    out_of_stock,
+  };
+};
+
+const createOrder = async ({
+  userId,
+  customerName,
+  phone,
+  destination,
+  orderDate,
+  note,
+  deliveryMethod,
+  items,
+}) => {
+  await validateOrderStock(items, orderDate);
+
+  const payload = {
+    user_id: userId,
+    customer_name: customerName,
+    phone: formatPhoneNumber(phone),
+    destination: destination || null,
+    order_date: orderDate,
+    note,
+    code: generateOrderCode(),
+    delivery_method: deliveryMethod,
+    items: items.map((item) => ({
+      menu_id: item.menu_id,
+      quantity: item.quantity,
+    })),
+  };
+
+  let itemsWithPrice = [];
+  for (const item of items) {
+    const menu = await menuService.getMenuById(item.menu_id);
+    if (!menu) {
+      throw {
+        statusCode: 400,
+        message: `Menu dengan ID ${item.menu_id} tidak ditemukan`,
+      };
+    }
+    itemsWithPrice.push({
+      ...item,
+      price: menu.price,
+    });
+  }
+
+  const { totalPerItem, totalPrice, discount } =
+    calculateOrderItems(itemsWithPrice);
+
+  return await prisma.$transaction(async (prisma) => {
+    const newOrder = await prisma.order.create({
+      data: {
+        eventDate: setDateTime(payload.order_date),
+        note: payload.note,
+        userId: payload.user_id,
+        code: payload.code,
+        totalPrice: totalPrice,
+        discount: discount,
+        orderItems: {
+          create: payload.items.map((item) => ({
+            menuId: item.menu_id,
+            quantity: item.quantity,
+            subtotal:
+              totalPerItem.find((i) => i.menu_id === item.menu_id)?.subtotal ||
+              0,
+          })),
+        },
+        createdAt: setDateTime(new Date()),
+        updatedAt: setDateTime(new Date()),
+      },
+    });
+
+    await prisma.stockOrder.updateMany({
+      where: {
+        eventDate: setDate(orderDate),
+      },
+      data: {
+        currentStock: {
+          increment: 1,
+        },
+        updatedAt: setDateTime(new Date()),
+      },
+    });
+
+    await prisma.shipping.create({
+      data: {
+        orderId: newOrder.id,
+        destination: payload.destination || null,
+        recipientName: payload.customer_name,
+        recipientPhone: payload.phone,
+        deliveryMethod: payload.delivery_method,
+        deliveredAt: setDateTime(payload.order_date),
+        createdAt: setDateTime(new Date()),
+        updatedAt: setDateTime(new Date()),
+      },
+    });
+
+    // user order, if >= 5, update to reguler_customer
+    const countUserOrder = await prisma.order.count({
+      where: {
+        userId: userId,
+      },
+    });
+
+    if (countUserOrder >= 5) {
+      await prisma.user.update({
+        where: {
+          id: userId,
+        },
+        data: {
+          customerType: CustomerType.reguler_customer,
+          updatedAt: setDateTime(new Date()),
+        },
+      });
+    }
+
+    // Kirim notifikasi WhatsApp ke admin
+    const adminPhone = process.env.ADMIN_WHATSAPP_NUMBER;
+    if (adminPhone) {
+      const orderItems = [];
+      for (const item of payload.items) {
+        const menu = await prisma.menu.findUnique({ where: { id: item.menu_id } });
+        const itemTotal = totalPerItem.find((i) => i.menu_id === item.menu_id);
+        orderItems.push({
+          name: menu?.name || item.menu_id,
+          quantity: item.quantity,
+          subtotal: itemTotal?.subtotal || 0,
+        });
+      }
+
+      const message = buildOrderNotificationMessage({
+        code: payload.code,
+        customerName: payload.customer_name,
+        phone: payload.phone,
+        destination: payload.destination,
+        orderDate: formatDateWIB(payload.order_date, false),
+        deliveryMethod: payload.delivery_method,
+        items: orderItems,
+        totalPrice,
+        note: payload.note,
+      });
+
+      sendWhatsAppNotification({ to: adminPhone, message }).catch((err) =>
+        console.error("[Order] Gagal kirim notifikasi WA:", err.message),
+      );
+    }
+
+    return newOrder;
+  });
+};
+
+const getOrders = async (filters) => {
+  const {
+    page,
+    limit,
+    userId,
+    isAdmin,
+    search,
+    shipping_status,
+    order_status,
+    delivery_method,
+    from,
+    to,
+  } = filters;
+
+  const parsedPage = parseInt(page) || 1;
+  const parsedLimit = parseInt(limit) || 10;
+
+  const eventDateFilter = {};
+  if (from) eventDateFilter.gte = setDateTime(from);
+  if (to) eventDateFilter.lte = setDateTimeEnd(to);
+
+  const whereClause = {
+    userId: isAdmin ? undefined : userId,
+    orderStatus: order_status ?? undefined,
+    eventDate: from || to ? eventDateFilter : undefined,
+    shipping: {
+      shippingStatus: shipping_status ?? undefined,
+      deliveryMethod: delivery_method ?? undefined,
+    },
+    OR: search
+      ? [
+          { user: { fullname: { contains: search, mode: "insensitive" } } },
+          { code: { contains: search, mode: "insensitive" } },
+          {
+            shipping: {
+              recipientName: search
+                ? { contains: search, mode: "insensitive" }
+                : undefined,
+              recipientPhone: search
+                ? { contains: search, mode: "insensitive" }
+                : undefined,
+            },
+          },
+        ]
+      : undefined,
+  };
+
+  const orders = await prisma.order.findMany({
+    orderBy: [
+      { eventDate: "desc" }, // prioritas 1
+      { createdAt: "desc" }, // prioritas 2 (tie-breaker)
+    ],
+    where: whereClause,
+    include: {
+      user: true,
+      orderItems: {
+        include: {
+          menu: true,
+        },
+      },
+      shipping: true,
+    },
+    take: parsedLimit,
+    skip: (parsedPage - 1) * parsedLimit,
+  });
+
+  const totalOrders = await prisma.order.count({
+    where: whereClause,
+  });
+
+  const mappedOrders = orders.map((order) => ({
+    id: order.id,
+    customer_name: order.shipping.recipientName,
+    ordered_by: {
+      fullname: order.user ? order.user.fullname : null,
+      email: order.user ? order.user.email : null,
+    },
+    phone: order.shipping ? order.shipping.recipientPhone : null,
+    destination: order.shipping ? order.shipping.destination : null,
+    note: order.note,
+    code: order.code,
+    order_date: order.eventDate,
+    order_status: order.orderStatus,
+    shipping_cost: order.shipping ? parseFloat(order.shipping.shippingCost) : 0,
+    total_price: parseFloat(order.totalPrice),
+    discount: parseFloat(order.discount),
+    normal_price: parseFloat(order.totalPrice) + parseFloat(order.discount),
+    final_price: parseFloat(order.totalPrice),
+    delivery_method: order.shipping ? order.shipping.deliveryMethod : null,
+    delivered_at: order.shipping ? order.shipping.deliveredAt : null,
+    shipping_status: order.shipping
+      ? order.shipping.shippingStatus
+      : "pesanan_disiapkan",
+    items: order.orderItems.map((item) => ({
+      menu_id: item.menuId,
+      menu_name: item.menu.name,
+      menu_price: parseFloat(item.menu.price),
+      menu_images: item.menu.images ? JSON.parse(item.menu.images) : [],
+      quantity: parseInt(item.quantity),
+      subtotal: parseFloat(item.subtotal),
+    })),
+  }));
+
+  const pagination = buildPagination(totalOrders, parsedPage, parsedLimit);
+  return {
+    orders: mappedOrders,
+    pagination,
+  };
+};
+
+const getOrderById = async (id) => {
+  const order = await prisma.order.findFirst({
+    where: {
+      id: id,
+    },
+    include: {
+      user: true,
+      orderItems: {
+        include: {
+          menu: true,
+        },
+      },
+      shipping: true,
+    },
+  });
+
+  if (!order) {
+    throw {
+      statusCode: 404,
+      message: "Order tidak ditemukan",
+    };
+  }
+
+  const mappedOrder = {
+    id: order.id,
+    customer_name: order.shipping ? order.shipping.recipientName : null,
+    ordered_by: {
+      id: order.userId,
+      fullname: order.user ? order.user.fullname : null,
+      email: order.user ? order.user.email : null,
+    },
+    phone: order.shipping ? order.shipping.recipientPhone : null,
+    destination: order.shipping ? order.shipping.destination : null,
+    note: order.note,
+    code: order.code,
+    order_date: order.eventDate,
+    order_status: order.orderStatus,
+    discount: parseFloat(order.discount),
+    normal_price: parseFloat(order.totalPrice) + parseFloat(order.discount),
+    final_price: parseFloat(order.totalPrice),
+    shipping_cost: order.shipping ? parseFloat(order.shipping.shippingCost) : 0,
+    delivery_method: order.shipping ? order.shipping.deliveryMethod : null,
+    delivered_at: order.shipping ? order.shipping.deliveredAt : null,
+    shipping_id: order.shipping.id || null,
+    shipping_status: order.shipping
+      ? order.shipping.shippingStatus
+      : "pesanan_disiapkan",
+    items: order.orderItems.map((item) => ({
+      menu_id: item.menuId,
+      menu_name: item.menu.name,
+      menu_price: parseFloat(item.menu.price),
+      menu_images: item.menu.images ? JSON.parse(item.menu.images) : [],
+      quantity: parseInt(item.quantity),
+      subtotal: parseFloat(item.subtotal),
+    })),
+  };
+
+  return mappedOrder || null;
+};
+
+const updateOrder = async (
+  id,
+  {
+    userId,
+    customerName,
+    phone,
+    destination,
+    orderDate,
+    note,
+    deliveryMethod,
+    orderStatus,
+    items,
+    shippingCost,
+    shippingStatus,
+    discount,
+  },
+) => {
+  const existingOrder = await getOrderById(id);
+
+  await validateOrderStock(items, orderDate, true);
+
+  const payload = {
+    user_id: userId,
+    customer_name: customerName,
+    phone: formatPhoneNumber(phone),
+    destination,
+    order_date: orderDate,
+    shipping_cost: shippingCost || 0,
+    note,
+    code: existingOrder.code || generateOrderCode(),
+    delivery_method: deliveryMethod,
+    order_status: orderStatus || existingOrder.order_status,
+    items: items.map((item) => ({
+      menu_id: item.menu_id,
+      quantity: item.quantity,
+    })),
+  };
+
+  // jika status order pesanan_diproses, jangan izinkan update tanggal atau ubah status menjadi pesanan_diterima atau pesanan_dibatalkan
+  if (
+    existingOrder.order_status === "pesanan_diproses" &&
+    (payload.order_status === "pesanan_diterima" ||
+      payload.order_status === "pesanan_dibatalkan" ||
+      !moment(setDate(existingOrder.order_date)).isSame(
+        setDate(payload.order_date),
+        "day",
+      ))
+  ) {
+    throw {
+      statusCode: 400,
+      message:
+        "Tidak dapat mengubah status menjadi pesanan_diterima atau pesanan_dibatalkan atau mengubah tanggal order karena status order saat ini adalah pesanan_diproses",
+    };
+  }
+
+  let itemsWithPrice = [];
+  for (const item of items) {
+    const menu = await menuService.getMenuById(item.menu_id);
+    if (!menu) {
+      throw {
+        statusCode: 400,
+        message: `Menu dengan ID ${item.menu_id} tidak ditemukan`,
+      };
+    }
+    itemsWithPrice.push({
+      ...item,
+      price: menu.price,
+    });
+  }
+
+  const {
+    totalPerItem,
+    totalPrice,
+    discount: calculatedDiscount,
+  } = calculateOrderItems(itemsWithPrice, shippingCost, discount);
+
+  // Invariant: order berkontribusi ke currentStock hanya jika status != pesanan_dibatalkan.
+  // Saat update, sesuaikan stock berdasarkan transisi (active <-> cancelled) dan/atau perubahan tanggal.
+  const existingOrderDate = setDate(existingOrder.order_date);
+  const newOrderDate = setDate(orderDate);
+  const wasActive = existingOrder.order_status !== "pesanan_dibatalkan";
+  const isActive = payload.order_status !== "pesanan_dibatalkan";
+  const dateChanged = !moment(existingOrderDate).isSame(newOrderDate, "day");
+
+  return await prisma.$transaction(async (prisma) => {
+    if (wasActive && (!isActive || dateChanged)) {
+      await prisma.stockOrder.updateMany({
+        where: { eventDate: existingOrderDate },
+        data: {
+          currentStock: { decrement: 1 },
+          updatedAt: setDateTime(new Date()),
+        },
+      });
+    }
+
+    if (isActive && (!wasActive || dateChanged)) {
+      await prisma.stockOrder.updateMany({
+        where: { eventDate: newOrderDate },
+        data: {
+          currentStock: { increment: 1 },
+          updatedAt: setDateTime(new Date()),
+        },
+      });
+    }
+
+    const updatedOrder = await prisma.order.update({
+      where: { id },
+      data: {
+        eventDate: setDateTime(payload.order_date),
+        note: payload.note,
+        code: payload.code,
+        totalPrice,
+        discount: calculatedDiscount,
+        orderStatus: payload.order_status,
+        orderItems: {
+          update: payload.items.map((item) => ({
+            where: { orderId_menuId: { orderId: id, menuId: item.menu_id } },
+            data: {
+              menuId: item.menu_id,
+              quantity: item.quantity,
+              subtotal:
+                totalPerItem.find((i) => i.menu_id === item.menu_id)
+                  ?.subtotal ?? 0,
+            },
+          })),
+        },
+
+        updatedAt: setDateTime(new Date()),
+      },
+    });
+
+    // Aturan ambil_sendiri: tidak ada lifecycle pengiriman riil.
+    // Shipping status selalu pesanan_disiapkan sampai order selesai atau dibatalkan.
+    const effectiveDeliveryMethod =
+      payload.delivery_method || existingOrder.delivery_method;
+    const isPickup = effectiveDeliveryMethod === "ambil_sendiri";
+
+    const resolvedShippingStatus =
+      payload.order_status === "pesanan_dibatalkan"
+        ? "pesanan_dibatalkan"
+        : isPickup && payload.order_status === "pesanan_selesai"
+          ? "pesanan_selesai"
+          : isPickup
+            ? "pesanan_disiapkan"
+            : shippingStatus || existingOrder.shipping_status;
+
+    await prisma.shipping.updateMany({
+      where: {
+        orderId: id,
+      },
+      data: {
+        destination: payload.destination,
+        recipientName: payload.customer_name,
+        recipientPhone: payload.phone,
+        deliveryMethod: payload.delivery_method,
+        shippingStatus: resolvedShippingStatus,
+        deliveredAt: setDateTime(payload.order_date),
+        shippingCost: payload.shipping_cost,
+        updatedAt: setDateTime(new Date()),
+      },
+    });
+
+    return updatedOrder;
+  });
+};
+
+const deleteOrder = async (id) => {
+  const existingOrder = await getOrderById(id, null, true);
+
+  if (existingOrder.order_status === "pesanan_diproses") {
+    throw {
+      statusCode: 400,
+      message: "Tidak dapat menghapus order dengan status pesanan_diproses",
+    };
+  }
+
+  // Kembalikan stock hanya jika order sebelumnya masih aktif (belum dibatalkan).
+  // Order yang sudah berstatus pesanan_dibatalkan stock-nya sudah dikembalikan saat cancel.
+  if (existingOrder.order_status !== "pesanan_dibatalkan") {
+    await prisma.stockOrder.updateMany({
+      where: {
+        eventDate: setDate(existingOrder.order_date),
+      },
+      data: {
+        currentStock: {
+          decrement: 1,
+        },
+        updatedAt: setDateTime(new Date()),
+      },
+    });
+  }
+
+  const deletedOrder = await prisma.$transaction(async (prisma) => {
+    await prisma.shipping.deleteMany({
+      where: {
+        orderId: id,
+      },
+    });
+
+    await prisma.orderItem.deleteMany({
+      where: {
+        orderId: id,
+      },
+    });
+
+    await prisma.order.delete({
+      where: {
+        id,
+      },
+    });
+  });
+
+  return deletedOrder;
+};
+
+const exportOrders = async (filters, type) => {
+  const exportType = type.toLowerCase();
+  const allowedTypes = ["csv", "xlsx", "pdf"];
+
+  if (!allowedTypes.includes(exportType)) {
+    throw {
+      statusCode: 400,
+      message: `Tipe ekspor tidak valid. Tipe yang diperbolehkan: ${allowedTypes.join(
+        ", ",
+      )}`,
+    };
+  }
+
+  const { userId, isAdmin, search, delivery_method, from, to } = filters;
+
+  const eventDateFilter = {};
+  if (from) eventDateFilter.gte = setDateTime(from);
+  if (to) eventDateFilter.lte = setDateTimeEnd(to);
+
+  const orders = await prisma.order.findMany({
+    orderBy: [{ eventDate: "asc" }, { createdAt: "asc" }],
+    where: {
+      userId: isAdmin ? undefined : userId,
+      orderStatus: "pesanan_selesai",
+      eventDate: from || to ? eventDateFilter : undefined,
+      shipping: {
+        is: {
+          shippingStatus: "pesanan_selesai",
+          deliveryMethod: delivery_method ?? undefined,
+        },
+      },
+      OR: search
+        ? [
+            { user: { fullname: { contains: search, mode: "insensitive" } } },
+            { code: { contains: search, mode: "insensitive" } },
+            {
+              shipping: {
+                recipientName: search
+                  ? { contains: search, mode: "insensitive" }
+                  : undefined,
+                recipientPhone: search
+                  ? { contains: search, mode: "insensitive" }
+                  : undefined,
+              },
+            },
+          ]
+        : undefined,
+    },
+    include: {
+      user: true,
+      orderItems: {
+        include: {
+          menu: true,
+        },
+      },
+      shipping: true,
+    },
+  });
+
+  const formatRupiah = (value) =>
+    `Rp ${Number(value || 0).toLocaleString("id-ID")}`;
+
+  const rows = orders.map((order, idx) => {
+    const items = order.orderItems || [];
+    const menuText = items
+      .map(
+        (item) =>
+          `${item.menu.name} x${item.quantity} (${formatRupiah(item.subtotal)})`,
+      )
+      .join("\n");
+
+    return {
+      No: idx + 1,
+      "Kode Order": order.code || "-",
+      Pelanggan: order.shipping?.recipientName || "-",
+      Telepon: order.shipping?.recipientPhone || "-",
+      Menu: menuText || "-",
+      Pengiriman: order.shipping?.deliveryMethod || "-",
+      Status: order.orderStatus || "-",
+      "Total Harga": formatRupiah(order.totalPrice),
+      Tanggal: formatDateWIB(order.eventDate, true),
+    };
+  });
+
+  // ── Total pendapatan (hanya pesanan & pengiriman yang sudah selesai) ──
+  const totalRevenue = orders.reduce((sum, o) => {
+    if (
+      o.orderStatus !== "pesanan_selesai" ||
+      o.shipping?.shippingStatus !== "pesanan_selesai"
+    ) {
+      return sum;
+    }
+    return sum + Number(o.totalPrice || 0);
+  }, 0);
+
+  const periodInfo =
+    from || to
+      ? `Periode: ${from ? formatDateWIB(from, false) : "-"} s/d ${to ? formatDateWIB(to, false) : "-"}`
+      : "Periode: Semua Transaksi";
+
+  const meta = {
+    brand: "Catering Dhewi",
+    title: "Laporan Transaksi",
+    info: [periodInfo, "Tipe Transaksi: Order Pelanggan"],
+    sheetName: "Laporan Transaksi",
+    footer: {
+      label: "Total Pendapatan:",
+      value: formatRupiah(totalRevenue),
+    },
+  };
+
+  if (exportType === "csv") return exporter.exportToCSV(rows, meta);
+  if (exportType === "xlsx") return exporter.exportToXLSX(rows, meta);
+  if (exportType === "pdf") return exporter.exportToPDF(rows, meta);
+};
+
+const validateInvoiceDownload = async (id) => {
+  const order = await getOrderById(id);
+
+  const isValid =
+    order.order_status !== "pesanan_dibatalkan" &&
+    order.shipping_status !== "pesanan_dibatalkan";
+
+  return {
+    is_valid_to_download: isValid,
+  };
+};
+
+const getInvoicePDF = async (id) => {
+  const order = await getOrderById(id);
+
+  const isValid =
+    order.order_status !== "pesanan_dibatalkan" &&
+    order.shipping_status !== "pesanan_dibatalkan";
+
+  if (!isValid) {
+    throw {
+      statusCode: 400,
+      message: "Invoice tidak dapat diunduh karena pesanan telah dibatalkan",
+    };
+  }
+
+  const invoiceData = {
+    ...order,
+    order_date_formatted: formatDateWIB(order.order_date, false),
+  };
+
+  const pdfBuffer = await generateInvoicePDF(invoiceData);
+  return { buffer: pdfBuffer, code: order.code };
+};
+
+const confirmOrder = async (order_id) => {
+  const order = await getOrderById(order_id);
+
+  if (!order) {
+    throw {
+      statusCode: 404,
+      message: "Order tidak ditemukan",
+    };
+  }
+
+  if (order.order_status !== "pesanan_diproses") {
+    throw {
+      statusCode: 400,
+      message:
+        "Hanya order dengan status pesanan_diproses yang dapat dikonfirmasi",
+    };
+  }
+
+  if (order.shipping_status === "pesanan_dibatalkan") {
+    throw {
+      statusCode: 400,
+      message:
+        "Tidak dapat mengkonfirmasi order karena status pengiriman adalah pesanan_dibatalkan",
+    };
+  }
+
+  if (order.shipping_status === "pesanan_diproses") {
+    throw {
+      statusCode: 400,
+      message:
+        "Tidak dapat mengkonfirmasi order karena status pengiriman adalah pesanan_diproses, hanya pesanan dalam proses pengiriman yang dapat dikonfirmasi",
+    };
+  }
+
+  if (order.shipping_status === "pesanan_selesai") {
+    throw {
+      statusCode: 400,
+      message:
+        "Tidak dapat mengkonfirmasi order karena status pengiriman adalah pesanan_selesai",
+    };
+  }
+
+  const updatedOrder = await prisma.$transaction(async (tx) => {
+    const updated = await tx.order.update({
+      where: { id: order_id },
+      data: {
+        orderStatus: "pesanan_selesai",
+        updatedAt: setDateTime(new Date()),
+      },
+    });
+
+    await tx.shipping.update({
+      where: { id: order.shipping_id },
+      data: {
+        shippingStatus: "pesanan_selesai",
+        updatedAt: setDateTime(new Date()),
+      },
+    });
+
+    return updated;
+  });
+
+  return updatedOrder;
+};
+
+const customerCancelOrder = async (order_id, user_id) => {
+  const order = await getOrderById(order_id);
+
+  if (!order) {
+    throw {
+      statusCode: 404,
+      message: "Order tidak ditemukan",
+    };
+  }
+
+  const isCustomerOrder = order.ordered_by.id === user_id;
+  if (!isCustomerOrder) {
+    throw {
+      statusCode: 403,
+      message: "Anda tidak memiliki izin untuk membatalkan order ini",
+    };
+  }
+
+  if (order.order_status !== "pesanan_diterima") {
+    throw {
+      statusCode: 400,
+      message:
+        "Hanya order dengan status pesanan_diterima atau belum diproses yang dapat dibatalkan oleh pelanggan",
+    };
+  }
+
+  return await prisma.$transaction(async (prisma) => {
+    const updatedOrder = await prisma.order.update({
+      where: { id: order_id },
+      data: {
+        orderStatus: "pesanan_dibatalkan",
+        updatedAt: setDateTime(new Date()),
+      },
+    });
+
+    await prisma.shipping.updateMany({
+      where: { orderId: order_id },
+      data: {
+        shippingStatus: "pesanan_dibatalkan",
+        updatedAt: setDateTime(new Date()),
+      },
+    });
+
+    // Kembalikan stock karena order dibatalkan (status sebelumnya: pesanan_diterima → aktif)
+    await prisma.stockOrder.updateMany({
+      where: { eventDate: setDate(order.order_date) },
+      data: {
+        currentStock: { decrement: 1 },
+        updatedAt: setDateTime(new Date()),
+      },
+    });
+
+    return updatedOrder;
+  });
+};
+
+export default {
+  validateOrderStock,
+  checkDateOrderStock,
+  createOrder,
+  getOrders,
+  getOrderById,
+  updateOrder,
+  deleteOrder,
+  exportOrders,
+  validateInvoiceDownload,
+  getInvoicePDF,
+  confirmOrder,
+  customerCancelOrder,
+};
