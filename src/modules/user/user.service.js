@@ -1,0 +1,190 @@
+import prisma from "../../config/db/prisma.js";
+import { buildPagination } from "../../common/response.js";
+import { formatPhoneNumber } from "../../utils/helpers.js";
+import bcryptjs from "bcryptjs";
+
+const getUsers = async (filters) => {
+  const {
+    page,
+    limit,
+    from,
+    to,
+    search,
+    customer_type,
+    type = "user",
+  } = filters;
+  const parsedPage = parseInt(page) || 1;
+  const parsedLimit = parseInt(limit) || 10;
+
+  const phoneSearch = search ? formatPhoneNumber(search) : null;
+  const where = {
+    ...(search && {
+      OR: [
+        { fullname: { contains: search, mode: "insensitive" } },
+        { email: { contains: search, mode: "insensitive" } },
+        ...(phoneSearch ? [{ phone: { contains: phoneSearch } }] : []),
+      ],
+    }),
+    customer_type: customer_type ? customer_type : undefined,
+    createdAt: {
+      gte: from ? new Date(from) : undefined,
+      lte: to ? new Date(to) : undefined,
+    },
+    // jika type customer, ambil user yang punya order saja
+    ...(type === "customer" && {
+      orders: {
+        some: {},
+      },
+      isActive: true,
+    }),
+  };
+
+  const users = await prisma.user.findMany({
+    take: parsedLimit,
+    skip: (parsedPage - 1) * parsedLimit,
+    where,
+  });
+
+  const usersCount = await prisma.user.count({
+    where,
+  });
+
+  const pagination = buildPagination(usersCount, parsedPage, parsedLimit);
+
+  for (const user of users) {
+    user.password = undefined;
+  }
+
+  return {
+    users,
+    pagination,
+  };
+};
+
+const getUserById = async (id) => {
+  const user = await prisma.user.findUnique({
+    where: { id },
+  });
+
+  if (!user) {
+    throw { statusCode: 400, message: "User tidak ditemukan" };
+  }
+
+  user.password = undefined;
+  return user;
+};
+
+const createUser = async (data) => {
+  const { fullname, email, password, phone, address, customer_type, role } =
+    data;
+
+  const existingUser = await prisma.user.findUnique({
+    where: { email },
+  });
+
+  if (existingUser) {
+    throw {
+      statusCode: 400,
+      message: "Email sudah terdaftar, silakan gunakan email lain",
+    };
+  }
+
+  const newUser = await prisma.user.create({
+    data: {
+      fullname,
+      email,
+      password: await bcryptjs.hash(password, 12),
+      phone: formatPhoneNumber(phone),
+      address,
+      role: role || "customer",
+      customerType: customer_type,
+    },
+  });
+
+  return newUser;
+};
+
+const updateUser = async (id, data) => {
+  const {
+    fullname,
+    email,
+    password,
+    phone,
+    address,
+    customer_type,
+    role,
+    is_active,
+  } = data;
+
+  const existingUser = await prisma.user.findUnique({
+    where: { email },
+  });
+
+  if (!existingUser) {
+    throw {
+      statusCode: 404,
+      message: "User tidak ditemukan",
+    };
+  }
+
+  if (existingUser && existingUser.id !== id) {
+    throw {
+      statusCode: 400,
+      message: "Email sudah terdaftar, silakan gunakan email lain",
+    };
+  }
+
+  const updatedUser = await prisma.user.update({
+    where: { id },
+    data: {
+      fullname,
+      email,
+      password: password ? await bcryptjs.hash(password, 12) : undefined,
+      phone: phone ? formatPhoneNumber(phone) : undefined,
+      address,
+      customerType: customer_type,
+      role,
+      isActive: is_active !== undefined ? is_active : existingUser.isActive,
+    },
+  });
+
+  return updatedUser;
+};
+
+const deleteUser = async (id, forceDelete = false) => {
+  const existingUser = await prisma.user.findUnique({
+    where: { id },
+  });
+
+  if (!existingUser) {
+    throw { statusCode: 404, message: "User tidak ditemukan" };
+  }
+
+  if (!forceDelete) {
+    await prisma.user.update({
+      where: { id },
+      data: {
+        isActive: false,
+      },
+    });
+    return;
+  }
+
+  await prisma.$transaction(async (tx) => {
+    const orders = await tx.order.findMany({
+      where: { userId: id },
+      select: { id: true },
+    });
+    const orderIds = orders.map((o) => o.id);
+
+    if (orderIds.length > 0) {
+      await tx.shipping.deleteMany({ where: { orderId: { in: orderIds } } });
+      await tx.orderItem.deleteMany({ where: { orderId: { in: orderIds } } });
+      await tx.order.deleteMany({ where: { id: { in: orderIds } } });
+    }
+
+    await tx.user.delete({ where: { id } });
+  });
+};
+
+export default { getUsers, getUserById, createUser, updateUser, deleteUser };
